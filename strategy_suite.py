@@ -8,23 +8,17 @@ arguments and returns a dictionary containing trade executions, equity curve
 information and a couple of helper statistics.
 """
 
-from __future__ import annotations
 
+from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Union
-
 import pandas as pd
-
 
 PriceInput = Union[str, pd.DataFrame]
 
 
 @dataclass
 class Execution:
-    """
-    Lightweight trade/execution log mainly used for debugging and reporting.
-    """
-
     date: pd.Timestamp
     symbol: str
     action: str
@@ -37,50 +31,38 @@ class Execution:
 
 
 def _load_price_frame(price_data: PriceInput, price_column: str) -> pd.DataFrame:
-    """
-    Normalise price input so every strategy can rely on a clean dataframe.
-    """
     if isinstance(price_data, pd.DataFrame):
         df = price_data.copy()
     else:
         df = pd.read_csv(price_data)
 
     if "date" not in df.columns:
-        raise ValueError("price_data must contain a 'date' column")
+        raise ValueError("price_data must contain 'date' column")
 
     df["date"] = pd.to_datetime(df["date"])
     if price_column not in df.columns:
-        raise ValueError(f"price_data must contain a '{price_column}' column")
+        raise ValueError(f"price_data must contain '{price_column}' column")
 
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
+    return df.sort_values("date").reset_index(drop=True)
 
 
 def _max_drawdown(equity_curve: List[float]) -> float:
-    """
-    Simple max drawdown helper based on a running peak observation.
-    """
-    drawdown = 0.0
-    peak = float("-inf")
-    for value in equity_curve:
-        peak = max(peak, value)
-        if peak > 0:
-            drawdown = min(drawdown, (value - peak) / peak)
-    return abs(drawdown)
+    peak = equity_curve[0]
+    max_dd = 0.0
+    for v in equity_curve:
+        peak = max(peak, v)
+        max_dd = min(max_dd, (v - peak) / peak)
+    return abs(max_dd)
 
 
 class BaseStrategy:
-    """
-    Lightweight base object used to keep bookkeeping consistent.
-    """
-
     def __init__(
         self,
         symbol: str,
         price_data: PriceInput,
         account_equity: float = 10_000.0,
         price_column: str = "price_usd",
-    ) -> None:
+    ):
         self.symbol = symbol.upper()
         self.price_column = price_column
         self.price_df = _load_price_frame(price_data, price_column)
@@ -91,11 +73,11 @@ class BaseStrategy:
         raise NotImplementedError
 
 
-class LeverageTrendStrategy(BaseStrategy):
-    """
-    Trend following strategy with leverage, TP/SL gates and daily funding costs.
-    """
+# ==========================================================
+# 1️⃣ LeverageTrendStrategy（修正版）
+# ==========================================================
 
+class LeverageTrendStrategy(BaseStrategy):
     def __init__(
         self,
         symbol: str,
@@ -105,15 +87,10 @@ class LeverageTrendStrategy(BaseStrategy):
         leverage_multiple: float = 2.0,
         margin_allocation: float = 0.7,
         daily_funding_rate: float = 0.0005,
-        long_trigger_pct: float = 0.35,
+        long_trigger_pct: float = 0.3,
         long_take_profit_pct: float = 0.3,
-        long_stop_loss_pct: float = 1.0,
-        enable_long: bool = True,
-        enable_short: bool = False,
-        short_trigger_pct: float = 0.35,
-        short_take_profit_pct: float = 0.3,
-        short_stop_loss_pct: float = 0.3,
-    ) -> None:
+        long_stop_loss_pct: float = 0.3,
+    ):
         super().__init__(symbol, price_data, account_equity)
         self.lookback_days = lookback_days
         self.leverage_multiple = leverage_multiple
@@ -122,75 +99,67 @@ class LeverageTrendStrategy(BaseStrategy):
         self.long_trigger_pct = long_trigger_pct
         self.long_take_profit_pct = long_take_profit_pct
         self.long_stop_loss_pct = long_stop_loss_pct
-        self.enable_long = enable_long
-        self.enable_short = enable_short
-        self.short_trigger_pct = short_trigger_pct
-        self.short_take_profit_pct = short_take_profit_pct
-        self.short_stop_loss_pct = short_stop_loss_pct
 
     def run(self) -> Dict:
         df = self.price_df
-        equity = self.initial_equity
+
+        cash = self.initial_equity
+        margin_locked = 0.0
+        position = None
         equity_curve: List[float] = []
-        position: Optional[Dict] = None
+        cooldown = False
 
-        for idx in range(self.lookback_days, len(df)):
-            row = df.iloc[idx]
-            price = float(row[self.price_column])
-            date = row["date"]
-            lookback_price = float(df.iloc[idx - self.lookback_days][self.price_column])
-            momentum = (price / lookback_price) - 1.0
+        for i in range(self.lookback_days, len(df)):
+            price = float(df.iloc[i][self.price_column])
+            date = df.iloc[i]["date"]
 
+            # ===== 更新浮动盈亏 =====
+            floating_pnl = 0.0
             if position:
-                notional = position["size"] * price
-                funding = abs(notional) * self.daily_funding_rate
-                equity -= funding
+                if position["direction"] == 1:
+                    floating_pnl = position["size"] * (price - position["entry_price"])
+                else:
+                    floating_pnl = position["size"] * (position["entry_price"] - price)
+
+                funding = abs(position["size"] * price) * self.daily_funding_rate
+                cash -= funding
                 position["funding_paid"] += funding
 
-                entry_price = position["entry_price"]
-                direction = position["direction"]
+            equity = cash + margin_locked + floating_pnl
 
-                take_profit_hit = False
-                stop_loss_hit = False
-
-                if direction == 1:
-                    if price >= entry_price * (1 + self.long_take_profit_pct):
-                        take_profit_hit = True
-                    if price <= entry_price * (1 - self.long_stop_loss_pct):
-                        stop_loss_hit = True
-                else:
-                    if price <= entry_price * (1 - self.short_take_profit_pct):
-                        take_profit_hit = True
-                    if price >= entry_price * (1 + self.short_stop_loss_pct):
-                        stop_loss_hit = True
-
-                if take_profit_hit or stop_loss_hit:
-                    gross_pnl = position["size"] * (price - entry_price) * direction
-                    equity += gross_pnl
-                    net_pnl = gross_pnl - position["funding_paid"]
-                    action = "CLOSE_LONG" if direction == 1 else "CLOSE_SHORT"
+            # ===== 平仓判断 =====
+            if position:
+                entry = position["entry_price"]
+                if (
+                    price >= entry * (1 + self.long_take_profit_pct)
+                    or price <= entry * (1 - self.long_stop_loss_pct)
+                ):
+                    realized_pnl = floating_pnl - position["funding_paid"]
+                    cash += margin_locked + floating_pnl
                     self.executions.append(
                         Execution(
                             date=date,
                             symbol=self.symbol,
-                            action=action,
+                            action="CLOSE_LONG",
                             quantity=position["size"],
                             price=price,
                             notional=position["size"] * price,
-                            pnl=net_pnl,
-                            notes="TP" if take_profit_hit else "SL",
-                            metadata={
-                                "entry_price": entry_price,
-                                "funding_paid": position["funding_paid"],
-                            },
+                            pnl=realized_pnl,
                         )
                     )
                     position = None
+                    margin_locked = 0.0
+                    cooldown = True
 
-            if position is None:
-                margin = equity * self.margin_allocation
-                if self.enable_long and momentum >= self.long_trigger_pct:
-                    size = (margin * self.leverage_multiple) / price
+            # ===== 开仓判断 =====
+            if not position and not cooldown:
+                lookback_price = float(df.iloc[i - self.lookback_days][self.price_column])
+                momentum = price / lookback_price - 1
+
+                if momentum >= self.long_trigger_pct:
+                    margin_locked = cash * self.margin_allocation
+                    cash -= margin_locked
+                    size = (margin_locked * self.leverage_multiple) / price
                     position = {
                         "direction": 1,
                         "entry_price": price,
@@ -205,372 +174,277 @@ class LeverageTrendStrategy(BaseStrategy):
                             quantity=size,
                             price=price,
                             notional=size * price,
-                            notes=f"momentum {momentum:.2%}",
-                        )
-                    )
-                elif self.enable_short and momentum <= -self.short_trigger_pct:
-                    size = (margin * self.leverage_multiple) / price
-                    position = {
-                        "direction": -1,
-                        "entry_price": price,
-                        "size": size,
-                        "funding_paid": 0.0,
-                    }
-                    self.executions.append(
-                        Execution(
-                            date=date,
-                            symbol=self.symbol,
-                            action="OPEN_SHORT",
-                            quantity=size,
-                            price=price,
-                            notional=size * price,
-                            notes=f"momentum {momentum:.2%}",
                         )
                     )
 
-            equity_curve.append(equity)
-
-        if position:
-            final_price = float(df[self.price_column].iloc[-1])
-            final_date = df["date"].iloc[-1]
-            direction = position["direction"]
-            entry_price = position["entry_price"]
-            gross_pnl = position["size"] * (final_price - entry_price) * direction
-            equity += gross_pnl
-            net_pnl = gross_pnl - position["funding_paid"]
-            action = "CLOSE_LONG" if direction == 1 else "CLOSE_SHORT"
-            self.executions.append(
-                Execution(
-                    date=final_date,
-                    symbol=self.symbol,
-                    action=action,
-                    quantity=position["size"],
-                    price=final_price,
-                    notional=position["size"] * final_price,
-                    pnl=net_pnl,
-                    notes="forced exit at end",
-                    metadata={"entry_price": entry_price, "funding_paid": position["funding_paid"]},
-                )
-            )
-            if equity_curve:
-                equity_curve[-1] = equity
-            else:
-                equity_curve.append(equity)
+            cooldown = False
+            equity_curve.append(cash + margin_locked + floating_pnl)
 
         return {
             "symbol": self.symbol,
-            "final_equity": equity,
+            "final_equity": equity_curve[-1],
             "equity_curve": equity_curve,
             "max_drawdown": _max_drawdown(equity_curve),
             "executions": self.executions,
         }
 
+
+# ==========================================================
+# 2️⃣ SimpleBuyDipStrategy（修正版）
+# ==========================================================
 
 class SimpleBuyDipStrategy(BaseStrategy):
-    """
-    Enhanced spot buy-the-dip strategy with optional rolling DCA legs.
-    """
-
     def __init__(
         self,
         symbol: str,
         price_data: PriceInput,
         account_equity: float = 10_000.0,
-        initial_buy_trigger: float = 0.7,
+        initial_buy_trigger: float = 0.8,
         initial_buy_amount: float = 0.4,
-        dca_triggers: Optional[Sequence[float]] = None,
-        dca_amounts: Optional[Sequence[float]] = None,
-        sell_trigger: float = 1.12,
-        sell_cost_mode: str = "average",
-        enable_bottom_fishing: bool = False,
-        bottom_fishing_drawdown: float = 0.5,
-    ) -> None:
+        dca_triggers: Sequence[float] = (0.7, 0.6),
+        dca_amounts: Sequence[float] = (0.3, 0.3),
+        sell_trigger: float = 1.15,
+    ):
         super().__init__(symbol, price_data, account_equity)
         self.initial_buy_trigger = initial_buy_trigger
         self.initial_buy_amount = initial_buy_amount
-        raw_triggers = list(dca_triggers) if dca_triggers is not None else [0.6, 0.5, 0.4]
-        if dca_amounts is None:
-            if raw_triggers:
-                residual = max(0.0, 1.0 - initial_buy_amount)
-                equal_share = residual / len(raw_triggers)
-                raw_amounts = [equal_share] * len(raw_triggers)
-            else:
-                raw_amounts = []
-        else:
-            if len(dca_amounts) != len(raw_triggers):
-                raise ValueError("dca_amounts and dca_triggers must match in size")
-            raw_amounts = list(dca_amounts)
-
-        pairs = sorted(zip(raw_triggers, raw_amounts), key=lambda item: item[0], reverse=True)
-        if pairs:
-            self.dca_triggers, self.dca_amounts = map(list, zip(*pairs))
-        else:
-            self.dca_triggers, self.dca_amounts = [], []
+        self.dca_triggers = list(dca_triggers)
+        self.dca_amounts = list(dca_amounts)
         self.sell_trigger = sell_trigger
-        self.sell_cost_mode = sell_cost_mode
-        self.enable_bottom_fishing = enable_bottom_fishing
-        self.bottom_fishing_drawdown = bottom_fishing_drawdown
 
     def run(self) -> Dict:
         df = self.price_df
+
         cash = self.initial_equity
         holdings = 0.0
         avg_cost = 0.0
-        initial_cost_basis = 0.0
-        cycle_high = float(df[self.price_column].iloc[0])
+        cycle_high = float(df.iloc[0][self.price_column])
         pending_dca = list(zip(self.dca_triggers, self.dca_amounts))
-        bottom_fished = False
         equity_curve: List[float] = []
 
         for _, row in df.iterrows():
             price = float(row[self.price_column])
             date = row["date"]
             cycle_high = max(cycle_high, price)
-            equity_curve.append(cash + holdings * price)
-
             drawdown = price / cycle_high
 
-            if holdings == 0 and drawdown <= self.initial_buy_trigger and self.initial_buy_amount > 0:
+            # ===== 初始买入 =====
+            if holdings == 0 and drawdown <= self.initial_buy_trigger:
                 spend = min(cash, self.initial_equity * self.initial_buy_amount)
                 if spend > 0:
-                    quantity = spend / price
-                    holdings += quantity
+                    qty = spend / price
+                    holdings += qty
                     cash -= spend
                     avg_cost = price
-                    initial_cost_basis = price
-                    self.executions.append(
-                        Execution(
-                            date=date,
-                            symbol=self.symbol,
-                            action="BUY_INITIAL",
-                            quantity=quantity,
-                            price=price,
-                            notional=spend,
-                            notes=f"drawdown {drawdown:.2%}",
-                        )
-                    )
                     pending_dca = list(zip(self.dca_triggers, self.dca_amounts))
-                    bottom_fished = False
+                    self.executions.append(
+                        Execution(date, self.symbol, "BUY_INITIAL", qty, price, spend)
+                    )
+
+            # ===== DCA =====
+            while holdings > 0 and pending_dca and drawdown <= pending_dca[-1][0]:
+                trigger, alloc = pending_dca.pop()
+                spend = min(cash, self.initial_equity * alloc)
+                if spend <= 0:
                     continue
+                qty = spend / price
+                avg_cost = (avg_cost * holdings + spend) / (holdings + qty)
+                holdings += qty
+                cash -= spend
+                self.executions.append(
+                    Execution(date, self.symbol, "BUY_DCA", qty, price, spend)
+                )
 
-            if holdings > 0:
-                while pending_dca and drawdown <= pending_dca[-1][0]:
-                    trigger, allocation = pending_dca.pop()
-                    spend = min(cash, self.initial_equity * allocation)
-                    if spend <= 0:
-                        continue
-                    quantity = spend / price
-                    new_cost = avg_cost * holdings + spend
-                    holdings += quantity
-                    cash -= spend
-                    avg_cost = new_cost / holdings
-                    self.executions.append(
-                        Execution(
-                            date=date,
-                            symbol=self.symbol,
-                            action="BUY_DCA",
-                            quantity=quantity,
-                            price=price,
-                            notional=spend,
-                            notes=f"trigger {trigger:.2f}",
-                        )
-                    )
+            # ===== 止盈卖出 =====
+            if holdings > 0 and price >= avg_cost * self.sell_trigger:
+                proceeds = holdings * price
+                pnl = proceeds - avg_cost * holdings
+                cash += proceeds
+                self.executions.append(
+                    Execution(date, self.symbol, "SELL", holdings, price, proceeds, pnl)
+                )
+                holdings = 0
+                avg_cost = 0
+                cycle_high = price
+                pending_dca = list(zip(self.dca_triggers, self.dca_amounts))
 
-                if (
-                    self.enable_bottom_fishing
-                    and not bottom_fished
-                    and drawdown <= self.bottom_fishing_drawdown
-                    and cash > 0
-                ):
-                    spend = cash
-                    quantity = spend / price if price else 0.0
-                    prev_holdings = holdings
-                    self.executions.append(
-                        Execution(
-                            date=date,
-                            symbol=self.symbol,
-                            action="BUY_BOTTOM",
-                            quantity=quantity,
-                            price=price,
-                            notional=cash,
-                            notes=f"drawdown {drawdown:.2%}",
-                        )
-                    )
-                    holdings += quantity
-                    cash = 0.0
-                    total_cost = (avg_cost * prev_holdings) + spend
-                    avg_cost = total_cost / holdings if holdings else 0.0
-                    bottom_fished = True
+            equity_curve.append(cash + holdings * price)
 
-                base_cost = initial_cost_basis if self.sell_cost_mode == "initial" else avg_cost
-                if base_cost > 0 and price >= base_cost * self.sell_trigger:
-                    proceeds = holdings * price
-                    pnl = proceeds - (avg_cost * holdings)
-                    cash += proceeds
-                    self.executions.append(
-                        Execution(
-                            date=date,
-                            symbol=self.symbol,
-                            action="SELL",
-                            quantity=holdings,
-                            price=price,
-                            notional=proceeds,
-                            pnl=pnl,
-                            notes="take profit",
-                        )
-                    )
-                    holdings = 0.0
-                    avg_cost = 0.0
-                    initial_cost_basis = 0.0
-                    cycle_high = price
-                    pending_dca = list(zip(self.dca_triggers, self.dca_amounts))
-                    bottom_fished = False
-
-        final_equity = cash + holdings * float(df[self.price_column].iloc[-1])
         return {
             "symbol": self.symbol,
-            "final_equity": final_equity,
+            "final_equity": equity_curve[-1],
             "equity_curve": equity_curve,
             "max_drawdown": _max_drawdown(equity_curve),
             "executions": self.executions,
-            "remaining_cash": cash,
+            "remaining_cash": cash,   # ✅ 新增
             "holdings": holdings,
+            "avg_cost": avg_cost,      # （可选，但强烈建议）
         }
 
 
-class BuyDipHoldStrategy(BaseStrategy):
-    """
-    Pure accumulation strategy that never sells and keeps stacking dips.
-    """
 
+# ==========================================================
+# 3️⃣ BuyDipHoldStrategy（修正版）
+# ==========================================================
+
+class BuyDipHoldStrategy(BaseStrategy):
     def __init__(
         self,
         symbol: str,
         price_data: PriceInput,
         account_equity: float = 10_000.0,
-        initial_buy_trigger: float = 0.7,
+        initial_buy_trigger: float = 0.8,
         initial_buy_amount: float = 0.3,
-        dca_triggers: Optional[Sequence[float]] = None,
-        dca_amounts: Optional[Sequence[float]] = None,
+        dca_triggers: Sequence[float] = (0.7, 0.6),
+        dca_amounts: Sequence[float] = (0.3, 0.4),
         depth_percentage: float = 0.05,
-    ) -> None:
+    ):
         super().__init__(symbol, price_data, account_equity)
         self.initial_buy_trigger = initial_buy_trigger
         self.initial_buy_amount = initial_buy_amount
-        raw_triggers = list(dca_triggers) if dca_triggers is not None else [0.6, 0.5, 0.3]
-        if dca_amounts is None:
-            if raw_triggers:
-                residual = max(0.0, 1.0 - initial_buy_amount)
-                equal_share = residual / len(raw_triggers)
-                raw_amounts = [equal_share] * len(raw_triggers)
-            else:
-                raw_amounts = []
-        else:
-            if len(dca_amounts) != len(raw_triggers):
-                raise ValueError("dca_amounts and dca_triggers must match in size")
-            raw_amounts = list(dca_amounts)
-
-        pairs = sorted(zip(raw_triggers, raw_amounts), key=lambda item: item[0], reverse=True)
-        if pairs:
-            self.dca_triggers, self.dca_amounts = map(list, zip(*pairs))
-        else:
-            self.dca_triggers, self.dca_amounts = [], []
+        self.dca_triggers = list(dca_triggers)
+        self.dca_amounts = list(dca_amounts)
         self.depth_percentage = depth_percentage
-        self.depth_allocation_pct = (
-            self.dca_amounts[-1] if self.dca_amounts else max(0.0, 1.0 - initial_buy_amount)
-        )
 
     def run(self) -> Dict:
         df = self.price_df
+
         cash = self.initial_equity
         holdings = 0.0
         avg_cost = 0.0
-        cycle_high = float(df[self.price_column].iloc[0])
-        next_depth_price: Optional[float] = None
+        cycle_high = float(df.iloc[0][self.price_column])
         pending_dca = list(zip(self.dca_triggers, self.dca_amounts))
+        next_depth_price = None
         equity_curve: List[float] = []
 
         for _, row in df.iterrows():
             price = float(row[self.price_column])
             date = row["date"]
-            cycle_high = max(cycle_high, price)
+
+            # 新高 → 重置 DCA
+            if price > cycle_high:
+                cycle_high = price
+                pending_dca = list(zip(self.dca_triggers, self.dca_amounts))
+
             drawdown = price / cycle_high
-            equity_curve.append(cash + holdings * price)
 
             if holdings == 0 and drawdown <= self.initial_buy_trigger:
-                allocation = min(cash, self.initial_equity * self.initial_buy_amount)
-                if allocation > 0:
-                    qty = allocation / price
-                    holdings += qty
-                    cash -= allocation
-                    avg_cost = price
-                    self.executions.append(
-                        Execution(
-                            date=date,
-                            symbol=self.symbol,
-                            action="BUY_INITIAL",
-                            quantity=qty,
-                            price=price,
-                            notional=allocation,
-                            notes=f"drawdown {drawdown:.2%}",
-                        )
-                    )
-                    next_depth_price = price * (1 - self.depth_percentage)
-                continue
-
-            if holdings > 0:
-                while pending_dca and drawdown <= pending_dca[-1][0]:
-                    trigger, allocation = pending_dca.pop()
-                    spend = min(cash, self.initial_equity * allocation)
-                    if spend <= 0:
-                        continue
+                spend = min(cash, self.initial_equity * self.initial_buy_amount)
+                if spend > 0:
                     qty = spend / price
-                    prev_holdings = holdings
                     holdings += qty
                     cash -= spend
-                    avg_cost = ((avg_cost * prev_holdings) + spend) / holdings
-                    self.executions.append(
-                        Execution(
-                            date=date,
-                            symbol=self.symbol,
-                            action="BUY_DCA",
-                            quantity=qty,
-                            price=price,
-                            notional=spend,
-                            notes=f"trigger {trigger:.2f}",
-                        )
-                    )
+                    avg_cost = price
                     next_depth_price = price * (1 - self.depth_percentage)
+                    self.executions.append(
+                        Execution(date, self.symbol, "BUY_INITIAL", qty, price, spend)
+                    )
 
-                if next_depth_price and price <= next_depth_price and cash > 0:
-                    spend = min(cash, self.initial_equity * self.depth_allocation_pct)
-                    if spend > 0:
-                        qty = spend / price
-                        prev_holdings = holdings
-                        holdings += qty
-                        cash -= spend
-                        avg_cost = ((avg_cost * prev_holdings) + spend) / holdings
-                        self.executions.append(
-                            Execution(
-                                date=date,
-                                symbol=self.symbol,
-                                action="BUY_DEPTH",
-                                quantity=qty,
-                                price=price,
-                                notional=spend,
-                                notes=f"depth ladder {self.depth_percentage:.2%}",
-                            )
-                        )
-                        next_depth_price = price * (1 - self.depth_percentage)
+            while holdings > 0 and pending_dca and drawdown <= pending_dca[-1][0]:
+                trigger, alloc = pending_dca.pop()
+                spend = min(cash, self.initial_equity * alloc)
+                if spend <= 0:
+                    continue
+                qty = spend / price
+                avg_cost = (avg_cost * holdings + spend) / (holdings + qty)
+                holdings += qty
+                cash -= spend
+                next_depth_price = price * (1 - self.depth_percentage)
+                self.executions.append(
+                    Execution(date, self.symbol, "BUY_DCA", qty, price, spend)
+                )
 
-        final_price = float(df[self.price_column].iloc[-1])
-        final_equity = cash + holdings * final_price
+            if next_depth_price and price <= next_depth_price and cash > 0:
+                spend = cash
+                qty = spend / price
+                avg_cost = (avg_cost * holdings + spend) / (holdings + qty)
+                holdings += qty
+                cash = 0
+                next_depth_price = price * (1 - self.depth_percentage)
+                self.executions.append(
+                    Execution(date, self.symbol, "BUY_DEPTH", qty, price, spend)
+                )
+
+            equity_curve.append(cash + holdings * price)
+
         return {
             "symbol": self.symbol,
-            "final_equity": final_equity,
+            "final_equity": equity_curve[-1],
             "equity_curve": equity_curve,
             "max_drawdown": _max_drawdown(equity_curve),
             "executions": self.executions,
             "holdings": holdings,
             "avg_cost": avg_cost,
         }
+
+
+
+def main(csv_path: str = "ada_usd_last_1y.csv") -> None:
+    """
+    Run all strategies against the ADA 1-year dataset and print summary stats.
+    """
+    df = pd.read_csv(csv_path)
+    if "date" not in df.columns:
+        if "datetime" in df.columns:
+            df = df.rename(columns={"datetime": "date"})
+        else:
+            raise ValueError("Input CSV must contain a 'date' or 'datetime' column")
+
+    leverage = LeverageTrendStrategy(
+        "ADA",
+        df,
+        lookback_days=10,
+        leverage_multiple=2.0,
+        margin_allocation=0.6,
+        long_trigger_pct=0.1,
+        long_take_profit_pct=0.1,
+        long_stop_loss_pct=0.3,
+    ).run()
+
+    buy_dip = SimpleBuyDipStrategy(
+        "ADA",
+        df,
+        initial_buy_trigger=0.9,
+        initial_buy_amount=0.3,
+        dca_triggers=[0.85, 0.75],
+        dca_amounts=[0.3, 0.2],
+        sell_trigger=1.15,
+    ).run()
+
+    buy_hold = BuyDipHoldStrategy(
+        "ADA",
+        df,
+        initial_buy_trigger=0.9,
+        initial_buy_amount=0.3,
+        dca_triggers=[0.85, 0.75],
+        dca_amounts=[0.3, 0.2],
+    ).run()
+
+    initial_equity = 10_000.0
+
+    def _fmt_return(final_equity: float) -> str:
+        return f"{((final_equity / initial_equity) - 1) * 100:.2f}%"
+
+    print("== LeverageTrendStrategy ==")
+    print(f"final_equity: {leverage['final_equity']:.2f}")
+    print(f"return: {_fmt_return(leverage['final_equity'])}")
+    print(f"executions: {len(leverage['executions'])}")
+    print(f"max_drawdown: {leverage['max_drawdown']:.4f}")
+
+    print("\n== SimpleBuyDipStrategy ==")
+    print(f"final_equity: {buy_dip['final_equity']:.2f}")
+    print(f"return: {_fmt_return(buy_dip['final_equity'])}")
+    print(f"remaining_cash: {buy_dip['remaining_cash']:.2f}")
+    print(f"holdings: {buy_dip['holdings']:.6f}")
+    print(f"executions: {len(buy_dip['executions'])}")
+
+    print("\n== BuyDipHoldStrategy ==")
+    print(f"final_equity: {buy_hold['final_equity']:.2f}")
+    print(f"return: {_fmt_return(buy_hold['final_equity'])}")
+    print(f"holdings: {buy_hold['holdings']:.6f}")
+    print(f"avg_cost: {buy_hold['avg_cost']:.6f}")
+    print(f"executions: {len(buy_hold['executions'])}")
+
+
+if __name__ == "__main__":
+    main()

@@ -235,10 +235,10 @@ top_df = fetch_top_marketcap(client=client, vs_currency="usd", top_n=100)
 print_top_marketcap(top_df, top_n=100)
 
 # 2) 下载过去一年 BTC 日/小时粒度（由 CoinGecko 自动采样）
-end = datetime.now(timezone.utc) - timedelta(days=365)
+end = datetime.now(timezone.utc)
 start = end - timedelta(days=365)
 
 btc_df = fetch_price_range("cardano", "usd", start, end, client=client, include=("prices",))
-btc_df.to_csv("ada_usd_last_2y.csv", index=False)
-print("\nSaved ada_usd_last_2y.csv, rows=", len(btc_df))
+btc_df.to_csv("ada_usd_last_1y.csv", index=False)
+print("\nSaved ada_usd_last_1y.csv, rows=", len(btc_df))
 
